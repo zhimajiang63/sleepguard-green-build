@@ -1,1 +1,464 @@
+name: Build SleepGuard Green Confirm APK
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch original SleepGuard 1.7.0 source
+        uses: actions/checkout@v4
+        with:
+          repository: OlafDrechsler/SleepGuard
+          ref: 0a252e350e18fe8bb2cd9049147051c8a49704f2
+          path: upstream
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Patch app with green rearm confirmation
+        shell: bash
+        run: |
+          cat > /tmp/patch_sleepguard.py <<'PY'
+          #!/usr/bin/env python3
+          """Patch official SleepGuard 1.7.0 with a post-lock green rearm button.
+          
+          Copyright (C) 2026: modification script.
+          Original project Copyright (C) 2026 Olaf Drechsler, GPL-3.0-or-later.
+          This modification is distributed under GPL-3.0-or-later as a derivative.
+          """
+          from __future__ import annotations
+          
+          import argparse
+          import difflib
+          import hashlib
+          from pathlib import Path
+          
+          EXPECTED_BLOB = {
+              "app/src/main/java/com/sleepguard/OverlayService.kt": "a1425c22000aa6ef93af76e1bfbc08368bd2ecd4",
+              "app/build.gradle": "8a95a483810298c4184d62e3c4398c997dd7d290",
+              "app/src/main/AndroidManifest.xml": "7069f349d51960eb978463ef6cfa1a83c9b49789",
+          }
+          
+          
+          def git_blob_hash(raw: bytes) -> str:
+              return hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+          
+          
+          def replace_once(src: str, old: str, new: str, name: str) -> str:
+              hits = src.count(old)
+              if hits != 1:
+                  raise ValueError(f"{name}: expected one anchor, found {hits}; upstream has changed")
+              return src.replace(old, new, 1)
+          
+          
+          def patch_service(s: str) -> str:
+              s = replace_once(s, "import android.content.ComponentName\n", "import android.content.BroadcastReceiver\nimport android.content.ComponentName\n", "receiver import")
+              s = replace_once(s, "import android.content.Intent\n", "import android.content.Intent\nimport android.content.IntentFilter\n", "filter import")
+              s = replace_once(s, " *    -> Dienst beendet sich selbst.", " *    -> Video-Modus wartet im Hintergrund bis zum naechsten Entsperren.", "service doc")
+          
+              s = replace_once(s, """    private var countdownTimer: CountDownTimer? = null
+          
+              companion object {""", """    private var countdownTimer: CountDownTimer? = null
+          
+              // Video: Nach Sperre keine Alarme mehr wecken. Auf Entsperren warten.
+              private var waitingForUnlock = false
+              // Beim Sperren Audio-Fokus halten, beim Entsperren wieder freigeben.
+              private var heldAudioFocus: AudioFocusRequest? = null
+          
+              private val screenReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      if (audioMode || !isRunning) return
+                      when (intent?.action) {
+                          Intent.ACTION_SCREEN_OFF -> enterStandbyUntilUnlock()
+                          Intent.ACTION_USER_PRESENT -> resumeAfterUnlock()
+                          Intent.ACTION_SCREEN_ON -> {
+                              // Unter manchen Konfigurationen gibt es kein USER_PRESENT.
+                              if (isScreenUsable()) resumeAfterUnlock()
+                          }
+                      }
+                  }
+              }
+          
+              companion object {""", "fields")
+          
+              s = replace_once(s, """    override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              }
+          """, """    override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val filter = IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_OFF)
+                      addAction(Intent.ACTION_SCREEN_ON)
+                      addAction(Intent.ACTION_USER_PRESENT)
+                  }
+                  // Seit Android 13 explizit als nicht-exportierten Receiver anmelden.
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      registerReceiver(screenReceiver, filter)
+                  }
+              }
+          """, "register receiver")
+          
+              s = replace_once(s, """            } else {
+                          // Video-Modus, Bildschirm aus/gesperrt: Der Kreis waere
+                          // unsichtbar, ein Countdown wuerde "aus dem Nichts" sperren.
+                          // Stattdessen still das naechste Intervall planen.
+                          scheduleOverlay()
+                      }
+                  } else {
+                      // Normaler Start -> naechste Anzeige planen.
+                      scheduleOverlay()
+                  }
+          """, """            } else {
+                          // Gesperrt: nicht staendig Wecker ausloesen; auf Unlock warten.
+                          enterStandbyUntilUnlock()
+                      }
+                  } else {
+                      // Normaler Start bzw. manuelles erneutes Starten.
+                      if (audioMode || isScreenUsable()) {
+                          waitingForUnlock = false
+                          releaseHeldAudioFocus()
+                          scheduleOverlay()
+                      } else {
+                          enterStandbyUntilUnlock()
+                      }
+                  }
+          """, "start command")
+          
+              s = replace_once(s, """    /**
+               * Nur wenn der Bildschirm an und entsperrt ist, kann der Benutzer den
+          """, """    /**
+               * Wartet mit aktiver Vordergrund-Dienst-Benachrichtigung bis zum Entsperren.
+               * Kein Alarm wird waehrend des Schlafs periodisch wiederholt.
+               */
+              private fun enterStandbyUntilUnlock() {
+                  waitingForUnlock = true
+                  cancelScheduledOverlay()
+                  cancelCountdown()
+                  removeOverlay()
+              }
+          
+              private fun resumeAfterUnlock() {
+                  if (!waitingForUnlock || !isRunning || audioMode) return
+                  waitingForUnlock = false
+                  releaseHeldAudioFocus()
+                  scheduleOverlay() // Neue volle Frist ab dem Entsperren.
+              }
+          
+              private fun releaseHeldAudioFocus() {
+                  val request = heldAudioFocus ?: return
+                  heldAudioFocus = null
+                  try {
+                      val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      audioManager.abandonAudioFocusRequest(request)
+                  } catch (_: Exception) {
+                      // Fokus kann zwischenzeitlich bereits anderweitig entzogen sein.
+                  }
+              }
+          
+              /**
+               * Nur wenn der Bildschirm an und entsperrt ist, kann der Benutzer den
+          """, "standby methods")
+          
+              s = replace_once(s, """                lockScreen()          // dann den Bildschirm sperren
+                          stopSelf()            // Dienst beenden
+          """, """                lockScreen()          // dann den Bildschirm sperren
+                          // NICHT stopSelf(): Benutzer muss nach Entsperren nicht neu starten.
+                          enterStandbyUntilUnlock()
+          """, "auto lock")
+          
+              s = replace_once(s, """     * sie pausieren daraufhin. Der Fokus wird bewusst NICHT wieder freigegeben,
+               * damit die andere App nicht von selbst weiterspielt.
+          """, """     * sie pausieren daraufhin. Im Video-Modus wird der Fokus bis zum naechsten
+               * Entsperren gehalten und danach freigegeben, damit Ton wieder moeglich ist.
+          """, "audio focus doc")
+          
+              s = replace_once(s, """        try {
+                      audioManager.requestAudioFocus(request)
+                  } catch (e: Exception) {
+                      // Fokus-Anfrage fehlgeschlagen — Sperre erfolgt trotzdem.
+                  }
+              }
+          """, """        try {
+                      if (audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                          heldAudioFocus = request
+                      }
+                  } catch (e: Exception) {
+                      // Fokus-Anfrage fehlgeschlagen — Sperre erfolgt trotzdem.
+                  }
+              }
+          """, "request audio focus")
+          
+              s = replace_once(s, """    override fun onDestroy() {
+                  super.onDestroy()
+                  cancelScheduledOverlay()
+                  cancelCountdown()
+                  removeOverlay()
+                  isRunning = false
+              }
+          """, """    override fun onDestroy() {
+                  cancelScheduledOverlay()
+                  cancelCountdown()
+                  removeOverlay()
+                  releaseHeldAudioFocus()
+                  unregisterReceiver(screenReceiver)
+                  isRunning = false
+                  super.onDestroy()
+              }
+          """, "destroy receiver")
+          
+              assert "enterStandbyUntilUnlock()" in s and "resumeAfterUnlock()" in s
+              assert "stopSelf()            // Dienst beenden" not in s
+              return s
+          
+          
+          
+          def patch_green_confirmation(s: str) -> str:
+              """After a SleepGuard-induced lock, offer a deliberate green rearm button on unlock.
+          
+              A manual screen-off resumes automatically. A SleepGuard auto-lock requires
+              explicit consent; ignoring green confirmation ends monitoring. No background
+              prompt is shown on the lock screen itself.
+              """
+              s = replace_once(s, "import android.graphics.PixelFormat\n", "import android.graphics.PixelFormat\nimport android.graphics.Color\nimport android.graphics.drawable.GradientDrawable\n", "green UI imports")
+              s = replace_once(s, "import android.widget.ImageView\n", "import android.widget.ImageView\nimport android.widget.TextView\n", "green text view import")
+              s = replace_once(s, "    private var countdownTimer: CountDownTimer? = null\n", """    private var countdownTimer: CountDownTimer? = null
+              private var greenConfirmView: View? = null
+              private var greenConfirmTimer: CountDownTimer? = null
+              // A true value means SleepGuard (not the user) locked the screen.
+              // This survives turning the screen off again while the green prompt is visible.
+              private var needsGreenConfirmation = false
+          """, "green state fields")
+          
+              # Protect against an already-dispatched AlarmManager intent arriving after
+              # the screen was locked and the old alarm was cancelled.
+              s = replace_once(s, """        if (intent?.action == ACTION_SHOW_OVERLAY) {
+                      // Der AlarmManager hat den Dienst geweckt.
+                      if (audioMode) {
+          """, """        if (intent?.action == ACTION_SHOW_OVERLAY) {
+                      // If a previous auto-lock requires consent, never show the red timer.
+                      if (!audioMode && needsGreenConfirmation) {
+                          if (isScreenUsable()) showGreenConfirmation()
+                          else enterStandbyUntilUnlock()
+                      } else if (audioMode) {
+          """, "guard against stale alarm")
+          
+              s = replace_once(s, """    private fun enterStandbyUntilUnlock() {
+                  waitingForUnlock = true
+                  cancelScheduledOverlay()
+                  cancelCountdown()
+                  removeOverlay()
+              }
+          """, """    private fun enterStandbyUntilUnlock() {
+                  waitingForUnlock = true
+                  cancelScheduledOverlay()
+                  cancelCountdown()
+                  removeOverlay()
+                  removeGreenConfirmation()
+              }
+          """, "standby clears prompt")
+          
+              s = replace_once(s, """    private fun resumeAfterUnlock() {
+                  if (!waitingForUnlock || !isRunning || audioMode) return
+                  waitingForUnlock = false
+                  releaseHeldAudioFocus()
+                  scheduleOverlay() // Neue volle Frist ab dem Entsperren.
+              }
+          """, """    private fun resumeAfterUnlock() {
+                  if (!waitingForUnlock || !isRunning || audioMode || !isScreenUsable()) return
+                  waitingForUnlock = false
+                  releaseHeldAudioFocus()
+                  if (needsGreenConfirmation) {
+                      showGreenConfirmation()
+                  } else {
+                      // User manually locked/slept the screen: resume without a prompt.
+                      scheduleOverlay()
+                  }
+              }
+          
+              /**
+               * After SleepGuard has locked the screen, do not automatically arm a new
+               * lock timer. Ask for confirmation only after the user unlocks the phone.
+               * If ignored for 30 seconds, the service stops; it never locks again
+               * because of this green button.
+               */
+              private fun showGreenConfirmation() {
+                  if (greenConfirmView != null) return
+                  if (!isScreenUsable()) {
+                      enterStandbyUntilUnlock()
+                      return
+                  }
+                  val density = resources.displayMetrics.density
+                  val greenButton = TextView(this).apply {
+                      text = "继续监测"
+                      setTextColor(Color.WHITE)
+                      textSize = 17f
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          setColor(Color.rgb(22, 150, 88))
+                          cornerRadius = 26f * density
+                      }
+                      elevation = 7f * density
+                      setOnClickListener {
+                          if (!isRunning) return@setOnClickListener
+                          removeGreenConfirmation()
+                          needsGreenConfirmation = false
+                          scheduleOverlay() // Begin another full monitoring interval.
+                      }
+                  }
+                  val params = WindowManager.LayoutParams(
+                      (150f * density).toInt(),
+                      (54f * density).toInt(),
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                      y = (88f * density).toInt()
+                  }
+                  try {
+                      windowManager.addView(greenButton, params)
+                  } catch (_: Exception) {
+                      // Without an operable button, never silently rearm the lock timer.
+                      stopSelf()
+                      return
+                  }
+                  greenConfirmView = greenButton
+                  greenConfirmTimer = object : CountDownTimer(30_000L, 1_000L) {
+                      override fun onTick(millisUntilFinished: Long) = Unit
+                      override fun onFinish() {
+                          removeGreenConfirmation()
+                          stopSelf()
+                      }
+                  }.start()
+              }
+          
+              private fun removeGreenConfirmation() {
+                  greenConfirmTimer?.cancel()
+                  greenConfirmTimer = null
+                  greenConfirmView?.let { view ->
+                      try {
+                          windowManager.removeView(view)
+                      } catch (_: Exception) {
+                          // Screen may already have been locked or the overlay removed.
+                      }
+                  }
+                  greenConfirmView = null
+              }
+          """, "unlock confirmation flow")
+          
+              s = replace_once(s, """            if (audioMode || isScreenUsable()) {
+                          waitingForUnlock = false
+                          releaseHeldAudioFocus()
+                          scheduleOverlay()
+          """, """            if (audioMode || isScreenUsable()) {
+                          waitingForUnlock = false
+                          needsGreenConfirmation = false
+                          removeGreenConfirmation()
+                          releaseHeldAudioFocus()
+                          scheduleOverlay()
+          """, "manual start clears pending confirmation")
+          
+              s = replace_once(s, """                lockScreen()          // dann den Bildschirm sperren
+                          // NICHT stopSelf(): Benutzer muss nach Entsperren nicht neu starten.
+                          enterStandbyUntilUnlock()
+          """, """                needsGreenConfirmation = true
+                          lockScreen()          // lock first, show green only on next unlock
+                          enterStandbyUntilUnlock()
+          """, "auto-lock requires green confirmation")
+          
+              s = replace_once(s, """        removeOverlay()
+                  releaseHeldAudioFocus()
+                  unregisterReceiver(screenReceiver)
+          """, """        removeOverlay()
+                  removeGreenConfirmation()
+                  releaseHeldAudioFocus()
+                  unregisterReceiver(screenReceiver)
+          """, "cleanup green overlay")
+              assert "needsGreenConfirmation = true" in s
+              assert "text = \"继续监测\"" in s
+              return s
+          
+          def patch_gradle(s: str) -> str:
+              s = replace_once(s, 'applicationId "com.sleepguard"', 'applicationId "com.sleepguard.greenconfirm"', "application id")
+              s = replace_once(s, 'versionName "1.7.0"', 'versionName "1.7.0-greenconfirm.1"', "version name")
+              return s
+          
+          
+          def patch_manifest(s: str) -> str:
+              return replace_once(s, 'android:label="@string/app_name"', 'android:label="SleepGuard 绿色确认版"', "app label")
+          
+          
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("project", type=Path, help="official SleepGuard checkout directory")
+              ap.add_argument("--dry-run", action="store_true", help="show diff without writing")
+              args = ap.parse_args()
+              root = args.project.resolve()
+              transforms = {
+                  "app/src/main/java/com/sleepguard/OverlayService.kt": lambda s: patch_green_confirmation(patch_service(s)),
+                  "app/build.gradle": patch_gradle,
+                  "app/src/main/AndroidManifest.xml": patch_manifest,
+              }
+              staged = {}
+              for rel, transform in transforms.items():
+                  path = root / rel
+                  raw = path.read_bytes()
+                  sha = git_blob_hash(raw)
+                  if sha != EXPECTED_BLOB[rel]:
+                      raise ValueError(f"File mismatch: {rel}\nExpected 1.7.0 SHA {EXPECTED_BLOB[rel]}\nGot {sha}\nRefusing to patch the wrong version.")
+                  before = raw.decode("utf-8")
+                  after = transform(before)
+                  staged[path] = (before, after)
+          
+              for path, (before, after) in staged.items():
+                  rel = path.relative_to(root)
+                  print(f"PATCHED {rel} ({len(before)} -> {len(after)} chars)")
+                  if args.dry_run:
+                      print("".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True), fromfile=f"a/{rel}", tofile=f"b/{rel}")))
+                  else:
+                      path.write_text(after, encoding="utf-8", newline="\n")
+              if not args.dry_run:
+                  print("OK: project modified. Build with ./gradlew assembleDebug")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
+          python3 /tmp/patch_sleepguard.py upstream
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK (separately installable)
+        working-directory: upstream
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SleepGuard-GreenConfirm-v1.7.0-APK
+          path: upstream/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
